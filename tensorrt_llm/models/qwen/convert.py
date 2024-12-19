@@ -1691,6 +1691,16 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
         weights.update(
             process_weight_and_params(v, f'{tllm_prex}.attention.dense'))
 
+        # 4.8 attn_bias
+        v = []
+        for comp in ["q", "k", "v"]:
+            m = load(f'{prefix}.self_attn.{comp}_proj.bias')
+            m = tp_split_weight_and_params(m, column_linear=False)
+            v.append(m)
+        c = torch.cat(v)
+        print(v.shape)
+        weights[f'{tllm_prex}.attention.qkv.bias'] = v.to(torch_dtype)
+
         # TODO: The naming here is tricky.
         # The implementation of GatedMLP is act(fc(x)) * gate(x).
         # However, the common convention is act(gate_proj(x)) * up_proj(x).
@@ -1725,14 +1735,6 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
         # 4.7 post_layernorm
         v = load(f'{prefix}.post_attention_layernorm.weight')
         weights[f'{tllm_prex}.post_layernorm.weight'] = v.to(torch_dtype)
-
-        # 4.8 attn_bias
-        for comp in ["q", "k", "v"]:
-            print(f'{prefix}.self_attn.{comp}_proj.bias')
-            print(load(f'{prefix}.self_attn.{comp}_proj.bias').shape)
-        v = torch.concat([load(f'{prefix}.self_attn.{comp}_proj.bias') for comp in ["q", "k", "v"]])
-        print(v.shape)
-        weights[f'{tllm_prex}.attention.qkv.bias'] = v.to(torch_dtype)
 
 
     tok = time.time()
