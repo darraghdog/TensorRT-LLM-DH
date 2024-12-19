@@ -17,6 +17,7 @@ import copy
 import os
 from typing import Optional, Union
 
+import transformers
 import torch
 from tqdm import tqdm
 
@@ -36,6 +37,8 @@ from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
 from .config import QWenConfig
 from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
                       load_weights_from_hf_model)
+from .convert import (load_weights_from_lmquant, load_weights_from_meta_ckpt)
+
 
 
 class QWenDecoderLayer(Module):
@@ -315,6 +318,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
 
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
         use_hf_gptq_checkpoint = kwargs.pop('use_hf_gptq_checkpoint', False)
+        quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -455,17 +459,22 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             if not use_preloading:
                 hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
 
-            logger.debug(f"HuggingFace model: {hf_model}")
+            if quant_ckpt_path is not None:
+                if quant_config.quant_mode.is_qserve_w4a8():
+                    weights = load_weights_from_lmquant(quant_ckpt_path, config)
 
-            model = QWenForCausalLM(config)
-
-            logger.debug(f"TensorRT-LLM model: {model}")
-
-            if use_hf_gptq_checkpoint:
-                weights = load_weights_from_hf_gptq_model(hf_model, config)
             else:
-                weights = load_weights_from_hf_model(hf_model, config)
+                #logger.debug(f"HuggingFace model: {hf_model}")
+                #model = QWenForCausalLM(config)
+                #logger.debug(f"TensorRT-LLM model: {model}")
+
+                if use_hf_gptq_checkpoint:
+                    weights = load_weights_from_hf_gptq_model(hf_model, config)
+                else:
+                    weights = load_weights_from_hf_model(hf_model, config)
             check_share_embedding(weights, config)
+            check_share_embedding(weights, config)
+            model = cls(config)
             model.load(weights)
         return model
 

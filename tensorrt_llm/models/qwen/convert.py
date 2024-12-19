@@ -28,6 +28,7 @@ import torch.nn as nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.pytorch_utils import Conv1D
+from pathlib import Path
 
 from ..._utils import pad_vocab_size, str_dtype_to_torch
 from ...logger import logger
@@ -1212,4 +1213,293 @@ def load_weights_from_hf_gptq_model(hf_model, config: QWenConfig):
     t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
     logger.info(f"weights loaded. total time: {t}")
 
+    return weights
+
+def load_torch_meta_ckpt(meta_ckpt_path: Path):
+    '''
+        meta_ckpt_path: The format of meta_ckpt_path is like <xxx>/consolidated.xx There are two possible cases:
+            1. A file like <xxx>/consolidated.xx.pth, loading it by torch.load directly
+            2. A folder like <xxx>/consolidated.xx/, need to load all weights in the folder.
+    '''
+    file_path = meta_ckpt_path.parent / (meta_ckpt_path.name + ".pth")
+    if file_path.exists() and file_path.is_file():
+        return torch.load(file_path, map_location="cpu")
+    else:
+        folder_path = meta_ckpt_path
+        assert folder_path.exists() and folder_path.is_dir()
+
+        ckpts = list(Path(folder_path).glob("consolidated-*.pth"))
+
+        all_weights = {}
+        for ckpt in ckpts:
+            _weight = torch.load(ckpt, map_location="cpu")
+            all_weights = all_weights | _weight
+            del _weight
+        return all_weights
+
+def fp8_per_channel_quant_weight_gpu(weight, clamp_val, rank=0):
+    weight = weight.to("cuda:" + str(rank))
+    # activation range bound.
+    x = weight.to(torch.float32).clamp(clamp_val[0], clamp_val[1])
+    xmax = x.abs().max(-1, keepdim=True).values
+    # minimum scaling factor.
+    torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
+    out = x / torch_weight_scales
+    torch_weight_scales = torch_weight_scales.reshape(-1)
+    out = torch.clamp(out, -448, 448)
+    processed_torch_weights = out.to(torch.float8_e4m3fn)
+
+    processed_torch_weights = processed_torch_weights.to(
+        torch.float8_e4m3fn).cpu()
+    torch_weight_scales = torch_weight_scales.cpu()
+
+    return processed_torch_weights, torch_weight_scales
+
+def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: QWenConfig):
+    torch_dtype = str_dtype_to_torch(config.dtype)
+    mapping = config.mapping
+    use_fp8_rowwise = config.quant_mode.has_fp8_rowwise()
+    if config.quant_mode.has_any_quant() and not use_fp8_rowwise:
+        logger.error(
+            "Meta ckpts only support fp8_rowwise quantization currently.")
+    weights = {}
+    # Meta's recipe of not using fp8 rowwise for the first and last layer.
+    exclude_layers_id = [0, config.num_hidden_layers - 1]
+
+    def gather_ckpts(ckpts):
+        gathered = {}
+        for k in ckpts[0]:
+            d = 0
+            # TODO(bhsueh) not sure should we consider tok here.
+            if any([n in k for n in ["wo", "w2"]]):
+                d = 1
+            if "norm" in k or "rope" in k:  # no TP
+                gathered[k] = ckpts[0][k].clone()
+            else:
+                gathered[k] = torch.cat([pt[k] for pt in ckpts], dim=d).clone()
+        return gathered
+
+    def split_ckpt(ckpt, ranks_per_ckpt, ckpt_rank):
+        split_ckpt = {}
+        for k, v in ckpt.items():
+            d = 0
+            if any(n in k for n in
+                   ["wo", "feed_forward.w2", "tok", "feed_forward.gate"]):
+                d = 1
+            if "norm" in k or "rope" in k:  # no TP
+                split_ckpt[k] = v.clone()
+            elif config.num_key_value_heads < mapping.tp_size and any(
+                    n in k for n in ["wk", "wv"]):
+                assert mapping.tp_size % config.num_key_value_heads == 0
+                # special case: we need to duplicate KV head
+                tmp = dup_kv_weight(v, config.num_key_value_heads,
+                                    mapping.tp_size)
+                split_ckpt[k] = torch.split(tmp,
+                                            tmp.shape[d] // ranks_per_ckpt,
+                                            dim=d)[ckpt_rank].clone()
+            else:
+                split_ckpt[k] = torch.split(v,
+                                            v.shape[d] // ranks_per_ckpt,
+                                            dim=d)[ckpt_rank].clone()
+        return split_ckpt
+
+    def get_current_weights(num_ckpts):
+        if num_ckpts > mapping.tp_size:
+            # combine ckpts
+            assert (num_ckpts % mapping.tp_size) == 0
+            nf = num_ckpts // mapping.tp_size
+            fs = nf * mapping.tp_rank
+            file_ids = list(range(fs, fs + nf))
+            ckpts = []
+            for f in file_ids:
+                ckpt = load_torch_meta_ckpt(
+                    Path(meta_ckpt_dir, f"consolidated.{f:02d}"))
+                ckpts.append(ckpt)
+            return gather_ckpts(ckpts)
+        elif num_ckpts < mapping.tp_size:
+            # split ckpt
+            assert (mapping.tp_size % num_ckpts) == 0
+            ranks_per_ckpt = mapping.tp_size // num_ckpts
+            ckpt_fid = mapping.tp_rank // ranks_per_ckpt
+            ckpt_rank = mapping.tp_rank % ranks_per_ckpt
+            nH_per_ckpt = config.num_attention_heads // num_ckpts
+            assert (nH_per_ckpt % ranks_per_ckpt) == 0
+            ckpt = load_torch_meta_ckpt(
+                Path(meta_ckpt_dir, f"consolidated.{ckpt_fid:02d}"))
+            return split_ckpt(ckpt, ranks_per_ckpt, ckpt_rank)
+
+        # num_ckpts == tensor_parallel, 1:1 mapping from files to TP
+        return load_torch_meta_ckpt(
+            Path(meta_ckpt_dir, f"consolidated.{mapping.tp_rank:02d}"))
+
+    def permute(w, nH, d, dH):
+        # due to MQA's wk, nH*dH != d could be true
+        return w.view(nH, dH // 2, 2, d).transpose(1, 2).reshape(nH * dH, d)
+
+    def extract_layer_idx(name):
+        ss = name.split('.')
+        for s in ss:
+            if s.isdigit():
+                return s
+        return None
+
+    if not hasattr(load_weights_from_meta_ckpt, "saved_embed"):
+        load_weights_from_meta_ckpt.saved_embed = None
+
+    def combine_embeddings(embeds, num_ckpts):
+        if len(embeds) == 1:
+            return embeds[0]
+        assert [
+            embeds[i].shape == embeds[i + 1].shape
+            for i in range(len(embeds) - 1)
+        ]
+        if embeds[0].shape[0] == config.vocab_size // num_ckpts:
+            merge_dim = 0
+        elif embeds[0].shape[1] == config.hidden_size // num_ckpts:
+            merge_dim = 1
+        else:
+            logger.error("Unable to infer embedding split dimension")
+            assert False, "Unable to infer embedding split dimension"
+        return torch.cat(embeds, dim=merge_dim)
+
+    def gather_embedding(cur_embed, name: str, num_ckpts):
+        if mapping.tp_size == 1:
+            # even if num_ckpts > 1, get_current_weights will already have it gathered
+            return cur_embed
+        if load_weights_from_meta_ckpt.saved_embed is None:
+            embeds = [None] * num_ckpts
+            for i in range(num_ckpts):
+                ckpt = load_torch_meta_ckpt(
+                    Path(meta_ckpt_dir, f"consolidated.{i:02d}"))
+                embeds[i] = ckpt[name]
+            embed = combine_embeddings(embeds, num_ckpts).to(torch_dtype)
+            load_weights_from_meta_ckpt.saved_embed = embed
+
+        return load_weights_from_meta_ckpt.saved_embed
+
+    logger.info('Loading weights from Meta LLaMA checkpoints ...')
+    tik = time.time()
+
+    num_kv_heads = config.num_key_value_heads
+    mha_mode = (num_kv_heads == config.num_attention_heads)
+
+    ckpts = list(Path(meta_ckpt_dir).glob("consolidated.*"))
+    num_ckpts = len(ckpts)
+    # llama/llama2 doesn't have MQA. So, simplifying loader logic by not worrying about it.
+    assert num_kv_heads > 1 or num_kv_heads >= num_ckpts, \
+        f"We don't know how the {num_kv_heads} KV heads are distributed among {num_ckpts} checkpoints."
+
+    tik = time.time()
+    ckpt = get_current_weights(num_ckpts)
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'[{mapping.rank}] get_current_weights. Total time: {t}')
+
+    head_size = config.hidden_size // config.num_attention_heads
+    layers_range = mapping.pp_layers(config.num_hidden_layers)
+
+    for l in layers_range:
+        prefix = f'layers.{l}.attention.'
+        q_weight = permute(ckpt[prefix + 'wq.weight'].clone(),
+                           nH=(config.num_attention_heads // mapping.tp_size),
+                           d=config.hidden_size,
+                           dH=head_size)
+        if num_kv_heads < mapping.tp_size and num_ckpts >= mapping.tp_size:
+            assert mapping.tp_size % num_kv_heads == 0
+            assert False, "Not supported yet"
+        k_weight = permute(ckpt[prefix + 'wk.weight'].clone(),
+                           nH=((num_kv_heads + mapping.tp_size - 1) //
+                               mapping.tp_size),
+                           d=config.hidden_size,
+                           dH=head_size)
+        v_weight = ckpt[prefix + 'wv.weight'].clone()
+
+        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+        ckpt[prefix + 'qkv.weight'] = qkv_weight
+
+    for k, v in tqdm(ckpt.items()):
+        dtype = torch_dtype if 'feed_forward.gate' not in k else torch.float32
+
+        v = v.to(dtype)
+        if "tok_embeddings" in k:
+            if not config.use_parallel_embedding:
+                v = gather_embedding(v, k, num_ckpts)
+            elif config.embedding_sharding_dim == 0:
+                # this needs a gather and then resplit along different dims
+                v = gather_embedding(v, k, num_ckpts)
+                v = split(v, mapping.tp_size, mapping.tp_rank, 0)
+            if mapping.is_first_pp_rank():
+                weights['transformer.vocab_embedding.weight'] = v
+        elif "output" in k:
+            if mapping.is_last_pp_rank():
+                if config.vocab_size % mapping.tp_size != 0:
+                    # padding
+                    vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                                       mapping.tp_size)
+                    pad_width = vocab_size_padded - config.vocab_size
+                    v = torch.from_numpy(
+                        np.pad(v.detach().cpu().numpy(),
+                               ((0, pad_width), (0, 0)),
+                               'constant',
+                               constant_values=0))
+                weights['lm_head.weight'] = v.detach().clone()
+        elif k == "norm.weight":
+            if mapping.is_last_pp_rank():
+                weights['transformer.ln_f.weight'] = v
+        else:
+            # layer specific weights
+            layer_idx = extract_layer_idx(k)
+            if layer_idx is None or int(layer_idx) not in layers_range:
+                continue
+
+            # Meta's recipe of not using fp8 rowwise for the first and last layer.
+            use_fp8_rowwise_in_layer = use_fp8_rowwise and (
+                int(layer_idx) not in exclude_layers_id)
+            idx = int(layer_idx) - layers_range[0]
+            tllm_prex = f'transformer.layers.{idx}.'
+
+            if 'attention_norm.weight' in k:
+                weights[tllm_prex + 'input_layernorm.weight'] = v
+            elif 'ffn_norm.weight' in k:
+                weights[tllm_prex + 'post_layernorm.weight'] = v
+            elif 'feed_forward.w3.weight' in k:
+                if use_fp8_rowwise_in_layer:
+                    processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
+                        v, config.quantization.clamp_val)
+                    weights[tllm_prex +
+                            'mlp.gate.weight'] = processed_torch_weights
+                    weights[tllm_prex +
+                            'mlp.gate.per_channel_scale'] = torch_weight_scales
+                else:
+                    weights[tllm_prex + 'mlp.gate.weight'] = v
+            elif 'feed_forward.w2.weight' in k:
+                if use_fp8_rowwise_in_layer:
+                    processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
+                        v, config.quantization.clamp_val)
+                    weights[tllm_prex +
+                            'mlp.proj.weight'] = processed_torch_weights
+                    weights[tllm_prex +
+                            'mlp.proj.per_channel_scale'] = torch_weight_scales
+                else:
+                    weights[tllm_prex + 'mlp.proj.weight'] = v
+            elif 'feed_forward.w1.weight' in k:
+                if use_fp8_rowwise_in_layer:
+                    processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
+                        v, config.quantization.clamp_val)
+                    weights[tllm_prex +
+                            'mlp.fc.weight'] = processed_torch_weights
+                    weights[tllm_prex +
+                            'mlp.fc.per_channel_scale'] = torch_weight_scales
+                else:
+                    weights[tllm_prex + 'mlp.fc.weight'] = v
+            elif 'attention.wo.weight' in k:
+                weights[tllm_prex + 'attention.dense.weight'] = v
+            elif 'attention.qkv.weight' in k:
+                weights[tllm_prex + 'attention.qkv.weight'] = v
+            elif 'feed_forward.gate' in k:
+                weights[tllm_prex + 'mlp.router.weight'] = v
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Weights loaded. Total time: {t}')
     return weights
