@@ -1501,6 +1501,7 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: QWenConfig):
                 weights[tllm_prex + 'attention.dense.weight'] = v
             elif 'attention.qkv.weight' in k:
                 weights[tllm_prex + 'attention.qkv.weight'] = v
+                print('Attention weight & dtype', v.shape, v.dtype)
             elif 'feed_forward.gate' in k:
                 weights[tllm_prex + 'mlp.router.weight'] = v
 
@@ -1532,11 +1533,16 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
     # scale.0, scale.1, zero
     quant_params = torch.load(lmquant_ckpt_path + '/scale.pt',
                               map_location='cpu')
-
+    print(50 * '--')
+    print('\n'.join(list(fake_quant_weights.keys())[:40])  )
+    print(50 * '--')
+    print('\n'.join(list(quant_params.keys())[:40])  )
+    print(50 * '--')
     def load(key):
         if 'zero' in key:
             v = quant_params[key]
             # https://github.com/mit-han-lab/qserve/blob/64ee627dfd747510809998d3592439f05a71ba31/scripts/ckpt_converter/checkpoint_converter.py#L99
+            # print(key, v.min(), v.max())
             if v.min() < 0:
                 v = v + 8
             return v
@@ -1546,11 +1552,11 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
 
     if per_group:
         lmquant_suffix = [
-            'weight', 'weight.scale.0', 'weight.scale.1', 'weight.zero'
+            'weight', 'weight.scale.0', 'weight.scale.1', 'weight.scaled_zero' # 'weight.zero'
         ]
         qserve_suffix = ['weight', 's1_scales', 's2_scales', 's2_zeros']
     else:
-        lmquant_suffix = ['weight', 'weight.scale.0', 'weight.zero']
+        lmquant_suffix = ['weight', 'weight.scale.0',  'weight.scaled_zero']# 'weight.zero']
         qserve_suffix = ['weight', 's1_scales', 's1_szeros']
 
     def tp_split_tensor(v: torch.Tensor, dim):
@@ -1617,7 +1623,6 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
                 weight, s1_scales, s1_zeros)
             qweight, s1_scales, s1_szeros = qserve_pack_reorder_per_channel(
                 qweight, s1_scales, s1_zeros)
-
             return {
                 # Note: Linear modules in TRTLLM use the name 'weight' instead of 'qweight'
                 f'{tllm_prex}.{qserve_suffix[0]}': qweight,
@@ -1656,6 +1661,8 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
         # 4.1 attention.qkv
         qkv_list = []
         for comp in ["q", "k", "v"]:
+            #for suffix in lmquant_suffix:
+            #    print(f'Load -- {prefix}.self_attn.{comp}_proj.{suffix}')
             v = [
                 load(f'{prefix}.self_attn.{comp}_proj.{suffix}')
                 for suffix in lmquant_suffix
@@ -1670,7 +1677,9 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
         ]
         weights.update(
             process_weight_and_params(qkv, f'{tllm_prex}.attention.qkv'))
+        # tmp_key = f'{tllm_prex}.attention.qkv'
 
+        # print(tmp_key, weights[tmp_key].shape, weights[tmp_key].dtype)
         # 4.2 attention.dense
         v = [
             load(f'{prefix}.self_attn.o_proj.{suffix}')

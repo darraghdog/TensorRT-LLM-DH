@@ -373,8 +373,6 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             loader.check_share_embedding(config)
-            model = cls(config)
-
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
 
                 def reshape_qkv(weights):
@@ -417,6 +415,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 loader.fill(tllm_weights)
             elif config.qwen_type == "qwen2_moe":
                 for tllm_key, _ in model.named_parameters():
+
                     sub_module = model
                     for attr in tllm_key.split(".")[:-1]:
                         sub_module = getattr(sub_module, attr)
@@ -461,6 +460,8 @@ class QWenForCausalLM(DecoderModelForCausalLM):
 
             if quant_ckpt_path is not None:
                 if quant_config.quant_mode.is_qserve_w4a8():
+                    print('Start loading lmquant')
+                    print(50 * '**')
                     weights = load_weights_from_lmquant(quant_ckpt_path, config)
 
             else:
@@ -475,6 +476,13 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             check_share_embedding(weights, config)
             check_share_embedding(weights, config)
             model = cls(config)
+            for k,m in weights.items():
+                DEVICE = m.device
+
+            for k,m in model.named_parameters():
+                if 'qkv.bias' in k:  
+                    print('Assign: ', k)
+                    weights[k] = torch.zeros(m.shape, dtype = torch.int8, device = DEVICE)
             model.load(weights)
         return model
 
