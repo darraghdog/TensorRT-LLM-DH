@@ -1534,9 +1534,9 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
     quant_params = torch.load(lmquant_ckpt_path + '/scale.pt',
                               map_location='cpu')
     print(50 * '--')
-    print('\n'.join(list(fake_quant_weights.keys())[:40])  )
+    print('\n'.join(list(fake_quant_weights.keys())[:15])  )
     print(50 * '--')
-    print('\n'.join(list(quant_params.keys())[:40])  )
+    print('\n'.join(list(quant_params.keys())[:15])  )
     print(50 * '--')
     def load(key):
         if 'zero' in key:
@@ -1675,6 +1675,8 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
             torch.concat((q[i], k[i], v[i]), dim=0)
             for i in range(len(lmquant_suffix))
         ]
+        # for m in qkv: print(m.shape)
+        # for k,m in process_weight_and_params(qkv, f'{tllm_prex}.attention.qkv').items(): print(k,m.shape)
         weights.update(
             process_weight_and_params(qkv, f'{tllm_prex}.attention.qkv'))
         # tmp_key = f'{tllm_prex}.attention.qkv'
@@ -1723,6 +1725,15 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: QWenConfig):
         # 4.7 post_layernorm
         v = load(f'{prefix}.post_attention_layernorm.weight')
         weights[f'{tllm_prex}.post_layernorm.weight'] = v.to(torch_dtype)
+
+        # 4.8 attn_bias
+        for comp in ["q", "k", "v"]:
+            print(f'{prefix}.self_attn.{comp}_proj.bias')
+            print(load(f'{prefix}.self_attn.{comp}_proj.bias').shape)
+        v = torch.concat([load(f'{prefix}.self_attn.{comp}_proj.bias') for comp in ["q", "k", "v"]])
+        print(v.shape)
+        weights[f'{tllm_prex}.attention.qkv.bias'] = v.to(torch_dtype)
+
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

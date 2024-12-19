@@ -335,6 +335,12 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               mapping=mapping,
                                               quant_config=quant_config,
                                               **kwargs)
+        model = cls(config)
+
+        #for k,m in model.named_parameters():
+        #    if 'qkv.bias' in k:  
+        #        print('Assign: ', k, m.shape)
+
 
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {}
@@ -476,13 +482,13 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             check_share_embedding(weights, config)
             check_share_embedding(weights, config)
             model = cls(config)
-            for k,m in weights.items():
-                DEVICE = m.device
+            #for k,m in weights.items():
+            #    DEVICE = m.device
 
-            for k,m in model.named_parameters():
-                if 'qkv.bias' in k:  
-                    print('Assign: ', k)
-                    weights[k] = torch.zeros(m.shape, dtype = torch.int8, device = DEVICE)
+            #for k,m in model.named_parameters():
+            #    if 'qkv.bias' in k:  
+            #        print('Assign: ', k)
+            #        weights[k] = torch.zeros(m.shape, device = DEVICE).half()
             model.load(weights)
         return model
 

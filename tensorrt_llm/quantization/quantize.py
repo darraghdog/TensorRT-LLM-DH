@@ -344,7 +344,7 @@ def qserve_quantize_weight_per_channel(
     qweight = qweight.add_(
         s1_zeros.reshape(out_features,
                          1).to(linear_weight.device).to(torch.int8))
-    print('Min max', qweight.min(), qweight.max())
+    # print('Min max', qweight.min(), qweight.max())
     # assert (qweight.min() >= 0
     #         and qweight.max() <= 15), "Quantized weight out of range"
     
